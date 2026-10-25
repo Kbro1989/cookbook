@@ -292,14 +292,14 @@ def find_files_to_scan(
     return files
 
 
-def get_changed_files_from_git(repo_root: pathlib.Path) -> List[str]:
+def get_changed_files_from_git(repo_root: pathlib.Path) -> Optional[List[str]]:
     """Finds files changed relative to upstream/main or origin/main via git diff.
 
     Args:
         repo_root: Root directory of repository.
 
     Returns:
-        List of changed relative file path strings.
+        List of changed relative file path strings, or None if no base is available.
     """
     # Try upstream/main, then origin/main, then HEAD~1
     base_refs = ["upstream/main", "origin/main", "main", "HEAD~1"]
@@ -308,13 +308,13 @@ def get_changed_files_from_git(repo_root: pathlib.Path) -> List[str]:
             cmd = ["git", "diff", "--name-only", f"{base}...HEAD"]
             out = subprocess.check_output(cmd, cwd=repo_root, text=True, stderr=subprocess.DEVNULL)
             lines = [line.strip() for line in out.splitlines() if line.strip().endswith((".md", ".ipynb"))]
-            if lines:
-                logger.info("Detected %d changed file(s) against %s", len(lines), base)
-                return lines
+            # A successful empty diff still establishes the comparison base.
+            logger.info("Detected %d changed file(s) against %s", len(lines), base)
+            return lines
         except Exception:
             continue
     logger.warning("Could not determine base branch for --changed. Falling back to all files.")
-    return []
+    return None
 
 
 def extract_links_from_file(file_path: pathlib.Path) -> List[Tuple[str, int]]:
@@ -397,9 +397,13 @@ def validate_internal_link(
         target_path = checker_config.repo_root / rel_subpath
         if not target_path.exists():
             return False, f"Target repository path does not exist on disk: {rel_subpath}"
-        if fragment and not fragment.startswith("scrollto="):
+        if (
+            fragment
+            and not fragment.startswith("scrollto=")
+            and target_path.suffix.lower() in (".md", ".ipynb")
+        ):
             anchors = get_file_anchors(target_path, checker_config)
-            if anchors and fragment not in anchors:
+            if fragment not in anchors:
                 return False, f"Anchor '#{fragment}' not found in target file: {rel_subpath}"
         return True, ""
 
@@ -413,7 +417,7 @@ def validate_internal_link(
         if fragment.startswith("scrollto="):
             return True, ""  # Colab UI cell scroll target
         anchors = get_file_anchors(source_file, checker_config)
-        if anchors and fragment not in anchors:
+        if fragment not in anchors:
             return False, f"In-page anchor '#{fragment}' not found in {source_file.name}"
         return True, ""
 
@@ -428,9 +432,14 @@ def validate_internal_link(
         return False, f"File does not exist: {clean_path} (resolved to {target_path})"
 
     # If anchor is present on local file, verify it exists
-    if fragment and not fragment.startswith("scrollto=") and target_path.is_file():
+    if (
+        fragment
+        and not fragment.startswith("scrollto=")
+        and target_path.is_file()
+        and target_path.suffix.lower() in (".md", ".ipynb")
+    ):
         anchors = get_file_anchors(target_path, checker_config)
-        if anchors and fragment not in anchors:
+        if fragment not in anchors:
             return False, f"Anchor '#{fragment}' not found in target file: {clean_path}"
 
     return True, ""
@@ -616,7 +625,7 @@ def main() -> None:
 
     if args.changed and not target_files:
         target_files = get_changed_files_from_git(repo_root)
-        if not target_files:
+        if target_files == []:
             print("No modified .md or .ipynb files detected against base branch.")
             sys.exit(0)
 

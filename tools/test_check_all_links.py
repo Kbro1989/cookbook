@@ -15,16 +15,23 @@
 
 """Unit tests for tools/check_all_links.py link verification logic."""
 
+import contextlib
+import io
 import json
 import pathlib
+import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from tools.check_all_links import (
     LinkCheckerConfig,
     extract_anchors_from_content,
     extract_links_from_file,
+    get_changed_files_from_git,
     get_file_anchors,
+    main,
     normalize_cell_source,
     run_link_audit,
     slugify_heading,
@@ -184,6 +191,59 @@ class TestCheckAllLinks(unittest.TestCase):
         self.assertEqual(normalize_cell_source(123), [])
         self.assertEqual(normalize_cell_source({}), [])
 
+    def test_missing_anchors_in_documents_without_headings(self) -> None:
+        """Deleting the last heading must not make broken fragments valid."""
+        documents = {
+            "empty.md": "No headings remain.\n",
+            "empty.ipynb": json.dumps(
+                {"cells": [{"cell_type": "markdown", "source": "No headings remain."}]}
+            ),
+        }
+        for name, content in documents.items():
+            target = self.repo_root / name
+            target.write_text(content, encoding="utf-8")
+            links = (
+                (self.readme_path, f"{name}#deleted-section"),
+                (target, "#deleted-section"),
+                (
+                    self.readme_path,
+                    f"https://github.com/google-gemini/cookbook/blob/main/{name}#deleted-section",
+                ),
+            )
+            for source, url in links:
+                with self.subTest(name=name, url=url):
+                    ok, err = validate_internal_link(source, url, self.config)
+                    self.assertFalse(ok)
+                    self.assertIn("'#deleted-section' not found", err)
+
+    def test_empty_document_anchor_audit_fails(self) -> None:
+        """The audit must fail for a broken link to a document with no anchors."""
+        target = self.repo_root / "empty.md"
+        target.write_text("No headings remain.\n", encoding="utf-8")
+        self.readme_path.write_text("[Section](empty.md#deleted-section)\n", encoding="utf-8")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            exit_code = run_link_audit(self.config, [str(self.readme_path)])
+        self.assertEqual(exit_code, 1, output.getvalue())
+        self.assertIn("Anchor '#deleted-section' not found", output.getvalue())
+
+    def test_non_document_and_colab_fragments_remain_allowed(self) -> None:
+        """Code line references and Colab scroll targets do not use heading slugs."""
+        target = self.repo_root / "sample.py"
+        target.write_text("print('hello')\n", encoding="utf-8")
+        self.readme_path.write_text("No headings.\n", encoding="utf-8")
+        for url in (
+            "sample.py#L1",
+            "https://github.com/google-gemini/cookbook/blob/main/sample.py#L1",
+            "#scrollTo=cell-intro-123",
+            "quickstarts/sample.ipynb#scrollTo=cell-intro-123",
+            "https://github.com/google-gemini/cookbook/blob/main/"
+            "quickstarts/sample.ipynb#scrollTo=cell-intro-123",
+        ):
+            with self.subTest(url=url):
+                ok, err = validate_internal_link(self.readme_path, url, self.config)
+                self.assertTrue(ok, err)
+
     def test_extract_links_handles_source_variations(self) -> None:
         """Verifies link extraction when notebook cell source is a string or None."""
         nb_str_source = {
@@ -288,6 +348,89 @@ class TestCheckAllLinks(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("nonexistent.md", err)
         self.assertNotIn("?raw=true", err)
+
+    def test_changed_files_stops_at_available_base_without_documents(self) -> None:
+        """An empty document diff must not select changes from an older base."""
+        for diff in ("", "tools/check_all_links.py\n"):
+            with self.subTest(diff=diff):
+                with mock.patch(
+                    "tools.check_all_links.subprocess.check_output",
+                    side_effect=[diff, "quickstarts/guide.md\n"],
+                ):
+                    self.assertEqual(get_changed_files_from_git(self.repo_root), [])
+
+    def test_changed_files_falls_back_when_base_is_unavailable(self) -> None:
+        """An unavailable upstream ref still falls back to origin and filters paths."""
+        with mock.patch(
+            "tools.check_all_links.subprocess.check_output",
+            side_effect=[
+                subprocess.CalledProcessError(128, "git diff"),
+                "README.md\ntools/check_all_links.py\nquickstarts/sample.ipynb\n",
+            ],
+        ):
+            self.assertEqual(
+                get_changed_files_from_git(self.repo_root),
+                ["README.md", "quickstarts/sample.ipynb"],
+            )
+
+    def test_changed_cli_skips_unrelated_broken_links(self) -> None:
+        """No document changes against origin must not audit an older broken guide."""
+        for diff in ("", "tools/check_all_links.py\n"):
+            with self.subTest(diff=diff):
+                output = io.StringIO()
+                with (
+                    mock.patch(
+                        "tools.check_all_links.subprocess.check_output",
+                        side_effect=[
+                            subprocess.CalledProcessError(128, "git diff"),
+                            diff,
+                            "quickstarts/guide.md\n",
+                        ],
+                    ),
+                    mock.patch.object(
+                        sys,
+                        "argv",
+                        ["check_all_links.py", "--repo-dir", str(self.repo_root), "--changed"],
+                    ),
+                    contextlib.redirect_stdout(output),
+                    self.assertRaises(SystemExit) as exit_context,
+                ):
+                    main()
+                self.assertEqual(exit_context.exception.code, 0, output.getvalue())
+                self.assertIn("No modified .md or .ipynb files detected", output.getvalue())
+
+    def test_changed_files_returns_none_when_no_base_is_available(self) -> None:
+        """Unavailable comparison bases must be distinct from an empty diff."""
+        with (
+            mock.patch(
+                "tools.check_all_links.subprocess.check_output",
+                side_effect=subprocess.CalledProcessError(128, "git diff"),
+            ),
+            self.assertLogs("link_checker", level="WARNING"),
+        ):
+            self.assertIsNone(get_changed_files_from_git(self.repo_root))
+
+    def test_changed_cli_audits_all_files_when_no_base_is_available(self) -> None:
+        """A Git repository without commits must still report broken links."""
+        subprocess.run(["git", "init", "--quiet"], cwd=self.repo_root, check=True)
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(pathlib.Path(__file__).with_name("check_all_links.py")),
+                "--repo-dir",
+                str(self.repo_root),
+                "--changed",
+            ],
+            cwd=self.repo_root,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("Falling back to all files", result.stderr)
+        self.assertIn("Scanning 3 file(s)", result.stderr)
+        self.assertIn("quickstarts/guide.md", result.stdout)
+        self.assertIn("quickstarts/sample.ipynb", result.stdout)
+        self.assertNotIn("No modified .md or .ipynb files detected", result.stdout)
 
 
 if __name__ == "__main__":
